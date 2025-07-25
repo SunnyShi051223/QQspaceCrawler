@@ -10,9 +10,9 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver import ActionChains
 
 # ---------- 默认配置（可通过 CLI 覆盖） ----------
-DEFAULT_QQ_ACCOUNT = '3287424602'      # 登录 QQ 账号
-DEFAULT_QQ_PASSWORD = 'shisannian1223'   # 登录 QQ 密码
-DEFAULT_TARGET_UIN = '3287424602'      # 目标 QQ 空间 UIN
+DEFAULT_QQ_ACCOUNT = ''      # 登录 QQ 账号
+DEFAULT_QQ_PASSWORD = ''   # 登录 QQ 密码
+DEFAULT_TARGET_UIN = ''      # 目标 QQ 空间 UIN
 CHROME_DRIVER = r'D:\chromedriver-win64\chromedriver-win64\chromedriver.exe'  # ChromeDriver 路径
 DEFAULT_CHROME_PATH = None     # Chrome 浏览器执行文件路径，若空则自动查找
 
