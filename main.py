@@ -1,6 +1,8 @@
 import time
 import csv
 import argparse
+import pymysql
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
@@ -9,12 +11,26 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver import ActionChains
 
-# ---------- 默认配置（可通过 CLI 覆盖） ----------
-DEFAULT_QQ_ACCOUNT = '3287424602'      # 登录 QQ 账号
-DEFAULT_QQ_PASSWORD = 'shisannian1223'   # 登录 QQ 密码
-DEFAULT_TARGET_UIN = ''      # 目标 QQ 账号
-CHROME_DRIVER = r'D:\chromedriver-win64\chromedriver-win64\chromedriver.exe'  # ChromeDriver 路径(这个要下载，包括Chrome，因为EdgeDriver暂时没有138版本的)
-DEFAULT_CHROME_PATH = None     # Chrome 浏览器执行文件路径，若空则自动查找
+# 数据库配置
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'shisannian1223',
+    'database': 'student_analysis',
+    'charset': 'utf8mb4',
+    'cursorclass': pymysql.cursors.DictCursor
+}
+
+
+
+# ---------- 默认配置 ----------
+DEFAULT_QQ_ACCOUNT = '3287424602'  # 登录 QQ 账号
+DEFAULT_QQ_PASSWORD = 'shisannian1223'  # 登录 QQ 密码
+CHROME_DRIVER = r'D:\\chromedriver-win64\\chromedriver-win64\\chromedriver.exe'  # ChromeDriver 路径
+DEFAULT_CHROME_PATH = None  # Chrome 浏览器执行文件路径
+DELAY_BETWEEN_TARGETS = 10  # 爬取不同目标账号之间的延迟（秒）
+MAX_RETRIES = 3  # 每个目标的最大重试次数
+
 
 # ---------- Selenium 驱动初始化 ----------
 def init_driver(chrome_binary_path=None, headless=False):
@@ -22,11 +38,22 @@ def init_driver(chrome_binary_path=None, headless=False):
     if chrome_binary_path:
         options.binary_location = chrome_binary_path
     options.add_argument('--start-maximized')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+
     if headless:
-        options.add_argument('--headless')
+        options.add_argument('--headless=new')
         options.add_argument('--disable-gpu')
+
     service = ChromeService(CHROME_DRIVER)
-    return webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=service, options=options)
+
+    # 隐藏自动化特征
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    return driver
+
 
 # ---------- 登录函数 ----------
 def login_qzone(driver, qq_account, qq_password):
@@ -54,6 +81,25 @@ def login_qzone(driver, qq_account, qq_password):
     print("[INFO] 登录中，等待跳转...")
     time.sleep(10)
     driver.switch_to.default_content()
+
+#---------- 从数据库获取QQ号 ----------
+def get_qq_numbers_from_database():
+    """从student表中获取所有QQ号(无限制)"""
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        with connection.cursor() as cursor:
+            # 注意：根据实际表结构调整SQL语句
+            cursor.execute("SELECT qq_id FROM students WHERE qq_id IS NOT NULL")
+            result = cursor.fetchall()
+            # 提取所有非空的qq_id
+            qq_numbers = [str(row['qq_id']) for row in result if row['qq_id']]
+            return qq_numbers
+    except pymysql.Error as e:
+        print(f'[ERROR] 从数据库获取QQ号失败: {e}')
+        return []
+    finally:
+        if 'connection' in locals() and connection.open:
+            connection.close()
 
 # ---------- 爬取函数 ----------
 def fetch_main_shuoshuo(driver, target_uin):
@@ -120,39 +166,132 @@ def fetch_main_shuoshuo(driver, target_uin):
     driver.switch_to.default_content()
     return all_data
 
+
 # ---------- 保存函数 ----------
+def save_to_database(data, qq_id):
+    """保存数据到MySQL数据库"""
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        with connection.cursor() as cursor:
+            # 检查QQ号是否存在于Students表
+            cursor.execute("SELECT id FROM Students WHERE qq_id = %s", (qq_id,))
+            if not cursor.fetchone():
+                # 如果不存在，则插入新记录
+                cursor.execute("INSERT INTO Students (qq_id) VALUES (%s)", (qq_id,))
+                connection.commit()
+                print(f"[INFO] 已添加新QQ号到数据库: {qq_id}")
+
+            # 插入说说数据
+            sql = """
+            INSERT INTO QQPosts (qq_id, post_at, content, images)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE content=VALUES(content), images=VALUES(images)
+            """
+            count = 0
+            for item in data:
+                time_text, content, images = item
+                # 转换时间格式，这里需要根据实际时间格式调整
+                try:
+                    post_at = datetime.strptime(time_text, '%Y-%m-%d %H:%M')
+                except:
+                    post_at = datetime.now()  # 如果解析失败，使用当前时间
+                
+                cursor.execute(sql, (qq_id, post_at, content, images))
+                count += 1
+            
+            connection.commit()
+            print(f'[INFO] 已保存 {count} 条说说到数据库 (QQ: {qq_id})')
+            return count
+            
+    except pymysql.Error as e:
+        print(f'[ERROR] 数据库操作失败: {e}')
+        # 如果数据库保存失败，回退到CSV保存
+        print('[WARNING] 数据库保存失败，将尝试保存到CSV文件')
+        return save_to_csv(data, f"{qq_id}_fallback.csv")
+    finally:
+        if 'connection' in locals() and connection.open:
+            connection.close()
+'''
 def save_to_csv(data, filename='shuoshuo.csv'):
+    """保留CSV"""
     with open(filename, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['time', 'content', 'images'])
         writer.writerows(data)
     print(f'[INFO] 已保存 {len(data)} 条说说到 {filename}')
+    return len(data)
+'''
 
-# ---------- CLI 参数解析 ----------
-def parse_args():
-    parser = argparse.ArgumentParser(description='QQ空间说说爬取')
-    parser.add_argument('--account', type=str, default=DEFAULT_QQ_ACCOUNT, help='登录 QQ 账号')
-    parser.add_argument('--password', type=str, default=DEFAULT_QQ_PASSWORD, help='登录 QQ 密码')
-    parser.add_argument('--target', type=str, default=DEFAULT_TARGET_UIN, help='目标 QQ 号')
-    parser.add_argument('--chrome-path', type=str, default=DEFAULT_CHROME_PATH, help='Chrome 可执行路径')
-    parser.add_argument('--headless', action='store_true', help='是否无头模式')
-    return parser.parse_args()
+
 
 # ---------- 主流程 ----------
 def main():
     args = parse_args()
-    if not (args.account and args.password and args.target):
-        print('请通过 --account, --password, --target 提供参数，或修改脚本默认值')
-        return
+
+    # 处理目标账号
+    if args.target:
+        # 如果通过命令行参数指定了目标QQ号
+        targets = [t.strip() for t in args.target.split(',') if t.strip()]
+    else:
+        # 否则从数据库读取目标QQ号
+        print('[INFO] 未指定目标QQ号，将从数据库读取...')
+        targets = get_qq_numbers_from_database()
+        if not targets:
+            print('错误：未找到有效的QQ号，请检查数据库连接或使用 --target 参数')
+            return
+        print(f'[INFO] 从数据库读取到 {len(targets)} 个目标QQ号')
+
+    print(f"[INFO] 准备爬取 {len(targets)} 个目标账号: {', '.join(targets)}")
+
     driver = init_driver(chrome_binary_path=args.chrome_path, headless=args.headless)
+
     try:
         login_qzone(driver, args.account, args.password)
-        result = fetch_main_shuoshuo(driver, args.target)
-        save_to_csv(result, filename=f"{args.target}.csv")
+        total_shuoshuo = 0
+
+        # 循环处理每个目标账号
+        for i, target_uin in enumerate(targets):
+            print(f"\n[INFO] 开始处理目标 {i + 1}/{len(targets)}: {target_uin}")
+
+            retries = 0
+            data = []
+
+            # 重试机制
+            while retries < args.retries and not data:
+                try:
+                    data = fetch_main_shuoshuo(driver, target_uin)
+                    if not data:
+                        print(f"[WARNING] 未获取到数据，可能是访问受限或账号不存在")
+                except Exception as e:
+                    print(f"[ERROR] 爬取 {target_uin} 时出错: {e}")
+
+                if not data:
+                    retries += 1
+                    if retries < args.retries:
+                        print(f"[INFO] 将在 {args.delay} 秒后重试 ({retries}/{args.retries})")
+                        time.sleep(args.delay)
+
+            if data:
+                # 保存到数据库
+                count = save_to_database(data, target_uin)
+                # 可选：同时保存一份CSV备份
+                # save_to_csv(data, filename=f"{target_uin}.csv")
+                total_shuoshuo += count
+            else:
+                print(f"[WARNING] 跳过目标账号 {target_uin}，未能获取数据")
+
+            # 如果不是最后一个目标，添加延迟
+            if i < len(targets) - 1:
+                print(f"[INFO] 等待 {args.delay} 秒后处理下一个目标...")
+                time.sleep(args.delay)
+
+        print(f"\n[SUCCESS] 所有目标处理完成！共爬取 {len(targets)} 个账号，总计 {total_shuoshuo} 条说说")
+
     except Exception as e:
-        print('[ERROR] 发生错误:', e)
+        print('[ERROR] 主流程发生错误:', e)
     finally:
         driver.quit()
+
 
 if __name__ == '__main__':
     main()
